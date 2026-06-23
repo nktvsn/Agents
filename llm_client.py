@@ -14,7 +14,7 @@ import httpx
 
 
 JsonDict = Dict[str, Any]
-StreamCallback = Callable[[str, JsonDict], None]
+StreamCallback = Callable[[str, Any], None]
 
 
 def _json_default(value: Any) -> Any:
@@ -45,34 +45,101 @@ def _redact_headers(headers: Mapping[str, str]) -> JsonDict:
     }
 
 
-def _extract_text(payload: Any) -> str:
+def _extract_role_chunks(
+    payload: Any,
+    *,
+    default_role: Optional[str] = None,
+) -> List[tuple]:
     if not isinstance(payload, dict):
-        return ""
+        return []
 
-    chunks: List[str] = []
+    chunks: List[tuple] = []
 
     # V2 response.
     for message in payload.get("messages") or []:
         if not isinstance(message, dict):
             continue
+        role = message.get("role") or default_role
         for item in message.get("content") or []:
             if isinstance(item, dict) and isinstance(item.get("text"), str):
-                chunks.append(item["text"])
+                chunks.append((role, item["text"]))
+
+    # Some SSE implementations send one message directly as the event payload.
+    if isinstance(payload.get("content"), list):
+        role = payload.get("role") or default_role
+        for item in payload["content"]:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                chunks.append((role, item["text"]))
 
     # V1-compatible response and stream deltas.
     for choice in payload.get("choices") or []:
         if not isinstance(choice, dict):
             continue
         container = choice.get("message") or choice.get("delta") or {}
+        role = (
+            container.get("role")
+            if isinstance(container, dict)
+            else None
+        ) or default_role or "assistant"
         content = container.get("content") if isinstance(container, dict) else None
         if isinstance(content, str):
-            chunks.append(content)
+            chunks.append((role, content))
         elif isinstance(content, list):
             for item in content:
                 if isinstance(item, dict) and isinstance(item.get("text"), str):
-                    chunks.append(item["text"])
+                    chunks.append((role, item["text"]))
 
-    return "".join(chunks)
+    return chunks
+
+
+def _text_for_role(payload: Any, role: str) -> str:
+    return "".join(
+        text
+        for chunk_role, text in _extract_role_chunks(payload)
+        if chunk_role == role
+    )
+
+
+def _stream_texts_by_role(events: List[JsonDict]) -> JsonDict:
+    result: JsonDict = {}
+    active_role: Optional[str] = None
+    for event in events:
+        if event.get("event") != "response.message.delta":
+            continue
+        chunks = _extract_role_chunks(
+            event.get("data"),
+            default_role=active_role,
+        )
+        for role, text in chunks:
+            resolved_role = role or active_role or "assistant"
+            active_role = resolved_role
+            result[resolved_role] = result.get(resolved_role, "") + text
+    return result
+
+
+class JupyterStreamPrinter:
+    """Print V2 stream deltas immediately in a Jupyter cell."""
+
+    def __init__(self, *, show_reasoning: bool = True) -> None:
+        self.show_reasoning = show_reasoning
+        self._active_role: Optional[str] = None
+        self._shown_roles: set = set()
+
+    def __call__(self, event: str, data: Any) -> None:
+        if event != "response.message.delta":
+            return
+        chunks = _extract_role_chunks(data, default_role=self._active_role)
+        for role, text in chunks:
+            resolved_role = role or self._active_role or "assistant"
+            self._active_role = resolved_role
+            if resolved_role == "reasoning" and not self.show_reasoning:
+                continue
+            if resolved_role not in self._shown_roles:
+                if self._shown_roles:
+                    print()
+                print(f"[{resolved_role}]")
+                self._shown_roles.add(resolved_role)
+            print(text, end="", flush=True)
 
 
 @dataclass
@@ -88,16 +155,28 @@ class RunResult:
 
     @property
     def text(self) -> str:
+        """Final assistant text. Kept as the main notebook convenience property."""
+        return self.assistant_text
+
+    @property
+    def texts_by_role(self) -> JsonDict:
         if self.events:
-            deltas = [
-                _extract_text(event.get("data"))
-                for event in self.events
-                if event.get("event") == "response.message.delta"
-            ]
-            if any(deltas):
-                return "".join(deltas)
-            return _extract_text(self.response)
-        return _extract_text(self.response)
+            streamed = _stream_texts_by_role(self.events)
+            if streamed:
+                return streamed
+        result: JsonDict = {}
+        for role, text in _extract_role_chunks(self.response):
+            resolved_role = role or "assistant"
+            result[resolved_role] = result.get(resolved_role, "") + text
+        return result
+
+    @property
+    def assistant_text(self) -> str:
+        return self.texts_by_role.get("assistant", "")
+
+    @property
+    def reasoning_text(self) -> str:
+        return self.texts_by_role.get("reasoning", "")
 
     @property
     def usage(self) -> JsonDict:
@@ -484,6 +563,15 @@ class LLMClient:
             },
         )
         (result.run_dir / "text.txt").write_text(result.text, encoding="utf-8")
+        (result.run_dir / "assistant.txt").write_text(
+            result.assistant_text,
+            encoding="utf-8",
+        )
+        if result.reasoning_text:
+            (result.run_dir / "reasoning.txt").write_text(
+                result.reasoning_text,
+                encoding="utf-8",
+            )
         if result.execution_steps:
             _write_json(
                 result.run_dir / "execution_steps.json",

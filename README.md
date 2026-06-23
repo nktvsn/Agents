@@ -45,10 +45,16 @@ result = client.step(
 )
 
 print(result.text)
+print(result.assistant_text)
+print(result.reasoning_text)
 print(result.usage)
 print(result.execution_steps)
 print(result.run_dir)
 ```
+
+`result.text` является коротким алиасом для `result.assistant_text`. Сообщения
+с ролью `reasoning` не смешиваются с финальным ответом и доступны через
+`result.reasoning_text`. Все собранные роли доступны в `result.texts_by_role`.
 
 Поля `model`, `messages`, `model_options`, `tools` и любые будущие параметры
 передаются в `step()` или `chat()` как есть.
@@ -71,22 +77,29 @@ result = client.chat(
 
 ## Потоковый ответ
 
-```python
-def print_event(event, data):
-    if event == "response.message.delta":
-        for choice in data.get("choices", []):
-            print(choice.get("delta", {}).get("content", ""), end="")
+В Jupyter callback вызывается при получении каждого SSE-события. Готовый
+printer понимает V2-сообщения с ролями `reasoning` и `assistant`:
 
+```python
+from llm_client import JupyterStreamPrinter
+
+printer = JupyterStreamPrinter(show_reasoning=True)
 result = client.step(
     "stream-call",
     model="GigaChat-2-Max",
     messages=[{"role": "user", "content": [{"text": "Напиши три пункта."}]}],
+    model_options={"reasoning": {"effort": "medium"}},
     stream=True,
-    on_event=print_event,
+    on_event=printer,
 )
+
+print("\n\nassistant:", result.assistant_text)
+print("reasoning:", result.reasoning_text)
 ```
 
-Все события сохраняются в `events.jsonl`.
+Вызов блокирует текущую ячейку до завершения ответа, но текст появляется
+постепенно. Прервать запрос можно кнопкой остановки kernel. Все сырые события
+сохраняются в `events.jsonl`.
 
 ## Остальные endpoints
 
@@ -115,6 +128,8 @@ custom = client.request(
 - `response.json`;
 - `metadata.json`;
 - `text.txt`;
+- `assistant.txt`;
+- `reasoning.txt`, если модель вернула reasoning;
 - `execution_steps.json`, если API их вернул;
 - `events.jsonl` для streaming;
 - `error.json` при ошибке.
@@ -134,4 +149,3 @@ with LLMClient.from_env() as client:
 
 Отключенная проверка сертификата сервера снижает защищенность соединения и
 должна использоваться только в доверенной сети.
-

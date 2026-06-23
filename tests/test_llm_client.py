@@ -27,6 +27,10 @@ class LLMClientTests(unittest.TestCase):
                 json={
                     "messages": [
                         {
+                            "role": "reasoning",
+                            "content": [{"text": "Сначала проверю."}],
+                        },
+                        {
                             "role": "assistant",
                             "content": [{"text": "Готово"}],
                         }
@@ -48,6 +52,15 @@ class LLMClientTests(unittest.TestCase):
                 )
 
             self.assertEqual(result.text, "Готово")
+            self.assertEqual(result.assistant_text, "Готово")
+            self.assertEqual(result.reasoning_text, "Сначала проверю.")
+            self.assertEqual(
+                result.texts_by_role,
+                {
+                    "reasoning": "Сначала проверю.",
+                    "assistant": "Готово",
+                },
+            )
             self.assertEqual(result.usage, {"total_tokens": 12})
             self.assertEqual(result.execution_steps, [{"event_type": "model"}])
             self.assertTrue((result.run_dir / "request.json").exists())
@@ -56,6 +69,14 @@ class LLMClientTests(unittest.TestCase):
             self.assertEqual(
                 (result.run_dir / "text.txt").read_text(encoding="utf-8"),
                 "Готово",
+            )
+            self.assertEqual(
+                (result.run_dir / "assistant.txt").read_text(encoding="utf-8"),
+                "Готово",
+            )
+            self.assertEqual(
+                (result.run_dir / "reasoning.txt").read_text(encoding="utf-8"),
+                "Сначала проверю.",
             )
             self.assertTrue((result.run_dir / "execution_steps.json").exists())
 
@@ -93,6 +114,7 @@ class LLMClientTests(unittest.TestCase):
                 )
 
             self.assertEqual(result.text, "Привет")
+            self.assertEqual(result.reasoning_text, "")
             self.assertEqual(result.usage, {"total_tokens": 7})
             self.assertEqual(len(observed), 3)
             self.assertEqual(
@@ -103,6 +125,41 @@ class LLMClientTests(unittest.TestCase):
                 ),
                 3,
             )
+
+    def test_v2_stream_separates_reasoning_and_assistant(self):
+        stream_body = "\n".join(
+            [
+                "event: response.message.delta",
+                'data: {"messages":[{"role":"reasoning","content":[{"text":"Думаю."}]}]}',
+                "",
+                "event: response.message.delta",
+                'data: {"messages":[{"role":"assistant","content":[{"text":"Ответ."}]}]}',
+                "",
+                "event: response.message.done",
+                'data: {"finish_reason":"stop","usage":{"total_tokens":9}}',
+                "",
+            ]
+        )
+
+        def handler(request):
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text=stream_body,
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.make_client(handler, temp_dir) as client:
+                result = client.step(
+                    "reasoning-stream",
+                    model="model",
+                    messages=[],
+                    stream=True,
+                )
+
+            self.assertEqual(result.reasoning_text, "Думаю.")
+            self.assertEqual(result.assistant_text, "Ответ.")
+            self.assertEqual(result.text, "Ответ.")
 
     def test_http_error_is_saved_and_exposes_run_dir(self):
         def handler(request):
