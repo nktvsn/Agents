@@ -418,6 +418,14 @@ class RunResult:
 
     @property
     def history_messages(self) -> List[JsonDict]:
+        return self.request_messages + [
+            message
+            for message in self.response_messages
+            if message.get("role") != "reasoning"
+        ]
+
+    @property
+    def full_history_messages(self) -> List[JsonDict]:
         return self.request_messages + self.response_messages
 
     @property

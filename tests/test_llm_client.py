@@ -311,6 +311,52 @@ class LLMClientTests(unittest.TestCase):
             self.assertTrue((first.run_dir / "history_messages.json").exists())
             self.assertEqual(second.text, "Второй ответ")
 
+    def test_history_messages_exclude_reasoning_by_default(self):
+        def handler(request):
+            return httpx.Response(
+                200,
+                json={
+                    "messages": [
+                        {
+                            "role": "reasoning",
+                            "content": [{"text": "Скрытое рассуждение"}],
+                        },
+                        {
+                            "role": "assistant",
+                            "content": [{"text": "Итог"}],
+                        },
+                    ]
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.make_client(handler, temp_dir) as client:
+                result = client.step(
+                    "reasoning-history",
+                    model="model",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [{"text": "Вопрос"}],
+                        }
+                    ],
+                )
+
+            self.assertEqual(
+                [message["role"] for message in result.response_messages],
+                ["reasoning", "assistant"],
+            )
+            self.assertEqual(
+                [message["role"] for message in result.history_messages],
+                ["user", "assistant"],
+            )
+            self.assertEqual(
+                [message["role"] for message in result.full_history_messages],
+                ["user", "reasoning", "assistant"],
+            )
+            self.assertNotIn("reasoning", result.history_texts_by_role)
+            self.assertEqual(result.reasoning_text, "Скрытое рассуждение")
+
     def test_http_error_is_saved_and_exposes_run_dir(self):
         def handler(request):
             return httpx.Response(422, json={"detail": "bad request"})

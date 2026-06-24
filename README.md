@@ -64,7 +64,8 @@ print(result.run_dir)
 ```python
 result.request_messages        # сообщения, которые ушли в запросе
 result.response_messages       # сообщения, которые вернула модель
-result.history_messages        # request_messages + response_messages
+result.history_messages        # request_messages + response_messages без reasoning
+result.full_history_messages   # request_messages + response_messages полностью
 
 result.request_texts_by_role
 result.response_texts_by_role
@@ -178,6 +179,10 @@ second = client.step(
     ],
 )
 ```
+
+`history_messages` не включает сообщения с ролью `reasoning`, чтобы не
+прокидывать внутренние рассуждения модели в следующий запрос. Если нужен полный
+след для анализа, используйте `full_history_messages` или `response_messages`.
 
 Тексты по ролям можно использовать для условий и переменных:
 
