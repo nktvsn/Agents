@@ -47,6 +47,7 @@ result = client.step(
 print(result.text)
 print(result.assistant_text)
 print(result.reasoning_text)
+print(result.function_calls)
 print(result.usage)
 print(result.execution_steps)
 print(result.run_dir)
@@ -54,7 +55,9 @@ print(result.run_dir)
 
 `result.text` является коротким алиасом для `result.assistant_text`. Сообщения
 с ролью `reasoning` не смешиваются с финальным ответом и доступны через
-`result.reasoning_text`. Все собранные роли доступны в `result.texts_by_role`.
+`result.reasoning_text`. Вызовы функций доступны через
+`result.function_calls` и `result.function_call_text`. Все собранные роли
+доступны в `result.texts_by_role`, включая `function_call`.
 
 Поля `model`, `messages`, `model_options`, `tools` и любые будущие параметры
 передаются в `step()` или `chat()` как есть.
@@ -101,6 +104,86 @@ print("reasoning:", result.reasoning_text)
 постепенно. Прервать запрос можно кнопкой остановки kernel. Все сырые события
 сохраняются в `events.jsonl`.
 
+## Вызовы функций
+
+Если модель вернула аргументы для вызова функции, клиент сохраняет их отдельно:
+
+```python
+result = client.step(
+    "weather-call",
+    model="GigaChat-2-Pro",
+    messages=[{"role": "user", "content": [{"text": "Погода в Манжероке"}]}],
+    functions=[
+        {
+            "name": "weather_forecast",
+            "description": "Возвращает прогноз погоды",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"},
+                    "num_days": {"type": "integer"},
+                },
+                "required": ["location"],
+            },
+        }
+    ],
+    function_call="auto",
+)
+
+print(result.function_calls)
+print(result.function_call_text)
+```
+
+Для V2-сообщений `function_call` извлекается из `content[].function_call`.
+Для совместимого формата он извлекается из `choices[].message.function_call`.
+На диск дополнительно пишутся `function_calls.json` и `function_call.txt`.
+
+## Предсохраненные шаги
+
+Можно заранее собрать набор шагов, сохранить их в JSON, а потом запускать в
+любой нужной последовательности:
+
+```python
+from llm_client import LLMPlan
+
+plan = LLMPlan()
+plan.add(
+    "extract-facts",
+    model="GigaChat-2-Max",
+    messages=[{"role": "user", "content": [{"text": "Вытащи факты из текста"}]}],
+    model_options={"temperature": 0},
+)
+plan.add(
+    "write-summary",
+    model="GigaChat-2-Max",
+    messages=[{"role": "user", "content": [{"text": "Сделай краткое резюме"}]}],
+    model_options={"temperature": 0.2},
+)
+
+plan.save("plans/demo.json")
+```
+
+В другой ячейке или в другой день:
+
+```python
+plan = LLMPlan.load("plans/demo.json")
+
+results = plan.run(client, sequence=["write-summary", "extract-facts"])
+
+print(results["write-summary"].assistant_text)
+print(results["extract-facts"].run_dir)
+```
+
+Один шаг можно выполнить отдельно и временно переопределить любые параметры:
+
+```python
+result = plan.run_one(
+    client,
+    "write-summary",
+    model_options={"temperature": 0.7},
+)
+```
+
 ## Остальные endpoints
 
 ```python
@@ -130,6 +213,7 @@ custom = client.request(
 - `text.txt`;
 - `assistant.txt`;
 - `reasoning.txt`, если модель вернула reasoning;
+- `function_calls.json` и `function_call.txt`, если модель вернула вызов функции;
 - `execution_steps.json`, если API их вернул;
 - `events.jsonl` для streaming;
 - `error.json` при ошибке.

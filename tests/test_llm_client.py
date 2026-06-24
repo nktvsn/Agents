@@ -5,7 +5,7 @@ from pathlib import Path
 
 import httpx
 
-from llm_client import LLMClient, LLMRequestError
+from llm_client import LLMClient, LLMPlan, LLMRequestError
 
 
 class LLMClientTests(unittest.TestCase):
@@ -161,6 +161,91 @@ class LLMClientTests(unittest.TestCase):
             self.assertEqual(result.assistant_text, "Ответ.")
             self.assertEqual(result.text, "Ответ.")
 
+    def test_v2_function_call_output_is_extracted_and_saved(self):
+        def handler(request):
+            return httpx.Response(
+                200,
+                json={
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "tools_state_id": "state-1",
+                            "content": [
+                                {
+                                    "function_call": {
+                                        "name": "weather_forecast",
+                                        "arguments": "{\"location\":\"Манжерок\"}",
+                                    }
+                                }
+                            ],
+                        }
+                    ]
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.make_client(handler, temp_dir) as client:
+                result = client.step("function-call", model="model", messages=[])
+
+            self.assertEqual(result.assistant_text, "")
+            self.assertEqual(
+                result.function_calls,
+                [
+                    {
+                        "role": "assistant",
+                        "function_call": {
+                            "name": "weather_forecast",
+                            "arguments": "{\"location\":\"Манжерок\"}",
+                        },
+                        "tools_state_id": "state-1",
+                    }
+                ],
+            )
+            self.assertIn("weather_forecast", result.function_call_text)
+            self.assertEqual(
+                result.texts_by_role["function_call"],
+                result.function_call_text,
+            )
+            self.assertTrue((result.run_dir / "function_calls.json").exists())
+            self.assertTrue((result.run_dir / "function_call.txt").exists())
+
+    def test_v1_function_call_output_is_extracted(self):
+        def handler(request):
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "role": "assistant",
+                                "function_call": {
+                                    "name": "weather_forecast",
+                                    "arguments": {
+                                        "location": "Манжерок",
+                                        "num_days": 10,
+                                    },
+                                },
+                                "functions_state_id": "state-2",
+                            },
+                            "finish_reason": "function_call",
+                        }
+                    ]
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.make_client(handler, temp_dir) as client:
+                result = client.step("v1-function-call", model="model", messages=[])
+
+            self.assertEqual(result.text, "")
+            self.assertEqual(result.function_calls[0]["role"], "assistant")
+            self.assertEqual(
+                result.function_calls[0]["function_call"]["arguments"]["num_days"],
+                10,
+            )
+            self.assertEqual(result.function_calls[0]["functions_state_id"], "state-2")
+
     def test_http_error_is_saved_and_exposes_run_dir(self):
         def handler(request):
             return httpx.Response(422, json={"detail": "bad request"})
@@ -180,6 +265,44 @@ class LLMClientTests(unittest.TestCase):
     def test_from_env_requires_all_variables(self):
         with self.assertRaises(ValueError):
             LLMClient.from_env(prefix="MISSING_TEST_")
+
+    def test_plan_saves_loads_and_runs_selected_sequence(self):
+        seen = []
+
+        def handler(request):
+            body = json.loads(request.content)
+            seen.append(body["marker"])
+            return httpx.Response(
+                200,
+                json={
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": [{"text": body["marker"]}],
+                        }
+                    ]
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan_path = Path(temp_dir) / "plan.json"
+            plan = LLMPlan()
+            plan.add("first", model="model", messages=[], marker="one")
+            plan.add(
+                "second",
+                payload={"model": "model", "messages": [], "marker": "two"},
+            )
+            plan.save(plan_path)
+
+            loaded = LLMPlan.load(plan_path)
+            with self.make_client(handler, temp_dir) as client:
+                results = loaded.run(client, sequence=["second", "first"])
+
+            self.assertEqual(loaded.names, ["first", "second"])
+            self.assertEqual(seen, ["two", "one"])
+            self.assertEqual(list(results), ["second", "first"])
+            self.assertEqual(results["second"].text, "two")
+            self.assertEqual(results["first"].text, "one")
 
 
 if __name__ == "__main__":

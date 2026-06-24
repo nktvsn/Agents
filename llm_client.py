@@ -37,6 +37,10 @@ def _safe_name(value: str) -> str:
     return cleaned or "step"
 
 
+def _json_text(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=_json_default)
+
+
 def _redact_headers(headers: Mapping[str, str]) -> JsonDict:
     sensitive = {"authorization", "proxy-authorization", "cookie", "set-cookie"}
     return {
@@ -92,6 +96,104 @@ def _extract_role_chunks(
     return chunks
 
 
+def _function_call_record(
+    function_call: Any,
+    *,
+    role: Optional[str] = None,
+    message: Optional[Mapping[str, Any]] = None,
+) -> Optional[JsonDict]:
+    if not isinstance(function_call, dict):
+        return None
+    record: JsonDict = {
+        "role": role or "assistant",
+        "function_call": dict(function_call),
+    }
+    if message:
+        for key in ("message_id", "tools_state_id", "functions_state_id"):
+            if key in message:
+                record[key] = message[key]
+    return record
+
+
+def _extract_function_calls(
+    payload: Any,
+    *,
+    default_role: Optional[str] = None,
+) -> List[JsonDict]:
+    if not isinstance(payload, dict):
+        return []
+
+    calls: List[JsonDict] = []
+
+    for message in payload.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role") or default_role or "assistant"
+        direct_call = _function_call_record(
+            message.get("function_call"),
+            role=role,
+            message=message,
+        )
+        if direct_call:
+            calls.append(direct_call)
+        for item in message.get("content") or []:
+            if not isinstance(item, dict):
+                continue
+            item_call = _function_call_record(
+                item.get("function_call"),
+                role=role,
+                message=message,
+            )
+            if item_call:
+                calls.append(item_call)
+
+    if isinstance(payload.get("content"), list):
+        role = payload.get("role") or default_role or "assistant"
+        for item in payload["content"]:
+            if not isinstance(item, dict):
+                continue
+            item_call = _function_call_record(
+                item.get("function_call"),
+                role=role,
+                message=payload,
+            )
+            if item_call:
+                calls.append(item_call)
+
+    for choice in payload.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        container = choice.get("message") or choice.get("delta") or {}
+        if not isinstance(container, dict):
+            continue
+        role = container.get("role") or default_role or "assistant"
+        direct_call = _function_call_record(
+            container.get("function_call"),
+            role=role,
+            message=container,
+        )
+        if direct_call:
+            calls.append(direct_call)
+        content = container.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_call = _function_call_record(
+                    item.get("function_call"),
+                    role=role,
+                    message=container,
+                )
+                if item_call:
+                    calls.append(item_call)
+
+    return calls
+
+
+def _function_call_text(calls: List[JsonDict]) -> str:
+    return "\n".join(_json_text(call["function_call"]) for call in calls)
+
+
 def _text_for_role(payload: Any, role: str) -> str:
     return "".join(
         text
@@ -114,7 +216,31 @@ def _stream_texts_by_role(events: List[JsonDict]) -> JsonDict:
             resolved_role = role or active_role or "assistant"
             active_role = resolved_role
             result[resolved_role] = result.get(resolved_role, "") + text
+        calls = _extract_function_calls(
+            event.get("data"),
+            default_role=active_role,
+        )
+        if calls:
+            result["function_call"] = (
+                result.get("function_call", "")
+                + ("\n" if result.get("function_call") else "")
+                + _function_call_text(calls)
+            )
     return result
+
+
+def _stream_function_calls(events: List[JsonDict]) -> List[JsonDict]:
+    calls: List[JsonDict] = []
+    active_role: Optional[str] = None
+    for event in events:
+        if event.get("event") != "response.message.delta":
+            continue
+        data = event.get("data")
+        chunks = _extract_role_chunks(data, default_role=active_role)
+        for role, _text in chunks:
+            active_role = role or active_role or "assistant"
+        calls.extend(_extract_function_calls(data, default_role=active_role))
+    return calls
 
 
 class JupyterStreamPrinter:
@@ -140,6 +266,14 @@ class JupyterStreamPrinter:
                 print(f"[{resolved_role}]")
                 self._shown_roles.add(resolved_role)
             print(text, end="", flush=True)
+        calls = _extract_function_calls(data, default_role=self._active_role)
+        for call in calls:
+            if "function_call" not in self._shown_roles:
+                if self._shown_roles:
+                    print()
+                print("[function_call]")
+                self._shown_roles.add("function_call")
+            print(_json_text(call["function_call"]), flush=True)
 
 
 @dataclass
@@ -168,6 +302,9 @@ class RunResult:
         for role, text in _extract_role_chunks(self.response):
             resolved_role = role or "assistant"
             result[resolved_role] = result.get(resolved_role, "") + text
+        calls = self.function_calls
+        if calls:
+            result["function_call"] = _function_call_text(calls)
         return result
 
     @property
@@ -177,6 +314,18 @@ class RunResult:
     @property
     def reasoning_text(self) -> str:
         return self.texts_by_role.get("reasoning", "")
+
+    @property
+    def function_calls(self) -> List[JsonDict]:
+        if self.events:
+            streamed = _stream_function_calls(self.events)
+            if streamed:
+                return streamed
+        return _extract_function_calls(self.response)
+
+    @property
+    def function_call_text(self) -> str:
+        return self.texts_by_role.get("function_call", "")
 
     @property
     def usage(self) -> JsonDict:
@@ -201,6 +350,122 @@ class RunResult:
             f"RunResult(name={self.name!r}, status_code={self.status_code}, "
             f"elapsed_seconds={self.elapsed_seconds:.3f}, run_dir={str(self.run_dir)!r})"
         )
+
+
+@dataclass
+class PlannedStep:
+    name: str
+    payload: JsonDict
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "PlannedStep":
+        name = data.get("name")
+        payload = data.get("payload")
+        if not isinstance(name, str) or not name:
+            raise ValueError("Planned step must have a non-empty string name")
+        if not isinstance(payload, dict):
+            raise ValueError(f"Planned step {name!r} must have a dict payload")
+        return cls(name=name, payload=dict(payload))
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "name": self.name,
+            "payload": self.payload,
+        }
+
+
+@dataclass
+class LLMPlan:
+    """A saved sequence of chat steps that can be executed later."""
+
+    steps: List[PlannedStep] = field(default_factory=list)
+
+    @classmethod
+    def load(cls, path: Union[str, Path]) -> "LLMPlan":
+        data = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+        steps = data.get("steps") if isinstance(data, dict) else None
+        if not isinstance(steps, list):
+            raise ValueError("Plan file must contain a 'steps' list")
+        return cls([PlannedStep.from_dict(step) for step in steps])
+
+    @property
+    def names(self) -> List[str]:
+        return [step.name for step in self.steps]
+
+    def add(
+        self,
+        name: str,
+        *,
+        payload: Optional[Mapping[str, Any]] = None,
+        replace: bool = False,
+        **parameters: Any,
+    ) -> "LLMPlan":
+        body = dict(payload or {})
+        body.update(parameters)
+        step = PlannedStep(name=name, payload=body)
+        existing_index = self._index_of(name)
+        if existing_index is not None:
+            if not replace:
+                raise ValueError(f"Step {name!r} already exists")
+            self.steps[existing_index] = step
+        else:
+            self.steps.append(step)
+        return self
+
+    def get(self, name: str) -> PlannedStep:
+        for step in self.steps:
+            if step.name == name:
+                return step
+        raise KeyError(name)
+
+    def save(self, path: Union[str, Path]) -> Path:
+        target = Path(path).expanduser()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            target,
+            {
+                "version": 1,
+                "steps": [step.to_dict() for step in self.steps],
+            },
+        )
+        return target
+
+    def run_one(
+        self,
+        client: "LLMClient",
+        name: str,
+        *,
+        on_event: Optional[StreamCallback] = None,
+        **overrides: Any,
+    ) -> RunResult:
+        payload = dict(self.get(name).payload)
+        payload.update(overrides)
+        return client.step(name, payload=payload, on_event=on_event)
+
+    def run(
+        self,
+        client: "LLMClient",
+        sequence: Optional[Iterable[str]] = None,
+        *,
+        on_event: Optional[StreamCallback] = None,
+        **overrides: Any,
+    ) -> Dict[str, RunResult]:
+        names = list(sequence) if sequence is not None else self.names
+        results: Dict[str, RunResult] = {}
+        for name in names:
+            results[name] = self.run_one(
+                client,
+                name,
+                on_event=on_event,
+                **overrides,
+            )
+        return results
+
+    def _index_of(self, name: str) -> Optional[int]:
+        for index, step in enumerate(self.steps):
+            if step.name == name:
+                return index
+        return None
 
 
 class LLMRequestError(RuntimeError):
@@ -570,6 +835,12 @@ class LLMClient:
         if result.reasoning_text:
             (result.run_dir / "reasoning.txt").write_text(
                 result.reasoning_text,
+                encoding="utf-8",
+            )
+        if result.function_calls:
+            _write_json(result.run_dir / "function_calls.json", result.function_calls)
+            (result.run_dir / "function_call.txt").write_text(
+                result.function_call_text,
                 encoding="utf-8",
             )
         if result.execution_steps:
