@@ -96,6 +96,81 @@ def _extract_role_chunks(
     return chunks
 
 
+def _copy_message(message: Mapping[str, Any]) -> JsonDict:
+    copied: JsonDict = {}
+    for key in (
+        "role",
+        "content",
+        "message_id",
+        "tools_state_id",
+        "functions_state_id",
+        "function_call",
+    ):
+        if key in message:
+            copied[key] = message[key]
+    return copied
+
+
+def _extract_messages(payload: Any) -> List[JsonDict]:
+    if not isinstance(payload, dict):
+        return []
+
+    messages: List[JsonDict] = []
+
+    for message in payload.get("messages") or []:
+        if isinstance(message, dict) and isinstance(message.get("role"), str):
+            messages.append(_copy_message(message))
+
+    if isinstance(payload.get("role"), str):
+        messages.append(_copy_message(payload))
+
+    for choice in payload.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if isinstance(message, dict) and isinstance(message.get("role"), str):
+            messages.append(_copy_message(message))
+
+    return messages
+
+
+def _text_chunks_from_messages(messages: Iterable[Mapping[str, Any]]) -> List[tuple]:
+    chunks: List[tuple] = []
+    for message in messages:
+        role = message.get("role") or "assistant"
+        content = message.get("content")
+        if isinstance(content, str):
+            chunks.append((role, content))
+        elif isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if isinstance(item.get("text"), str):
+                    chunks.append((role, item["text"]))
+                function_result = item.get("function_result")
+                if isinstance(function_result, dict):
+                    result = function_result.get("result")
+                    if isinstance(result, str):
+                        chunks.append((role, result))
+        function_call = message.get("function_call")
+        if isinstance(function_call, dict):
+            chunks.append(("function_call", _json_text(function_call)))
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and isinstance(item.get("function_call"), dict):
+                    chunks.append(("function_call", _json_text(item["function_call"])))
+    return chunks
+
+
+def message_texts_by_role(messages: Iterable[Mapping[str, Any]]) -> JsonDict:
+    """Collect text-like message content by role."""
+    result: JsonDict = {}
+    for role, text in _text_chunks_from_messages(messages):
+        resolved_role = role or "assistant"
+        result[resolved_role] = result.get(resolved_role, "") + text
+    return result
+
+
 def _function_call_record(
     function_call: Any,
     *,
@@ -243,6 +318,24 @@ def _stream_function_calls(events: List[JsonDict]) -> List[JsonDict]:
     return calls
 
 
+def _stream_messages(events: List[JsonDict]) -> List[JsonDict]:
+    messages: List[JsonDict] = []
+    for role, text in _stream_texts_by_role(events).items():
+        if role == "function_call":
+            continue
+        messages.append({"role": role, "content": [{"text": text}]})
+    for call in _stream_function_calls(events):
+        message: JsonDict = {
+            "role": call.get("role") or "assistant",
+            "content": [{"function_call": call["function_call"]}],
+        }
+        for key in ("message_id", "tools_state_id", "functions_state_id"):
+            if key in call:
+                message[key] = call[key]
+        messages.append(message)
+    return messages
+
+
 class JupyterStreamPrinter:
     """Print V2 stream deltas immediately in a Jupyter cell."""
 
@@ -306,6 +399,38 @@ class RunResult:
         if calls:
             result["function_call"] = _function_call_text(calls)
         return result
+
+    @property
+    def request_messages(self) -> List[JsonDict]:
+        payload = self.request.get("json")
+        if not isinstance(payload, dict):
+            return []
+        messages = payload.get("messages")
+        return [dict(message) for message in messages if isinstance(message, dict)] if isinstance(messages, list) else []
+
+    @property
+    def response_messages(self) -> List[JsonDict]:
+        if self.events:
+            streamed = _stream_messages(self.events)
+            if streamed:
+                return streamed
+        return _extract_messages(self.response)
+
+    @property
+    def history_messages(self) -> List[JsonDict]:
+        return self.request_messages + self.response_messages
+
+    @property
+    def request_texts_by_role(self) -> JsonDict:
+        return message_texts_by_role(self.request_messages)
+
+    @property
+    def response_texts_by_role(self) -> JsonDict:
+        return self.texts_by_role
+
+    @property
+    def history_texts_by_role(self) -> JsonDict:
+        return message_texts_by_role(self.history_messages)
 
     @property
     def assistant_text(self) -> str:
@@ -827,6 +952,10 @@ class LLMClient:
                 "saved_at": datetime.now(timezone.utc),
             },
         )
+        if result.response_messages:
+            _write_json(result.run_dir / "response_messages.json", result.response_messages)
+        if result.history_messages:
+            _write_json(result.run_dir / "history_messages.json", result.history_messages)
         (result.run_dir / "text.txt").write_text(result.text, encoding="utf-8")
         (result.run_dir / "assistant.txt").write_text(
             result.assistant_text,

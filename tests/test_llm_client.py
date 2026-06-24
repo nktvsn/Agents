@@ -246,6 +246,71 @@ class LLMClientTests(unittest.TestCase):
             )
             self.assertEqual(result.function_calls[0]["functions_state_id"], "state-2")
 
+    def test_history_messages_include_user_and_model_response(self):
+        def handler(request):
+            body = json.loads(request.content)
+            if len(body["messages"]) == 1:
+                return httpx.Response(
+                    200,
+                    json={
+                        "messages": [
+                            {
+                                "role": "assistant",
+                                "content": [{"text": "Первый ответ"}],
+                            }
+                        ]
+                    },
+                )
+            self.assertEqual(body["messages"][0]["role"], "user")
+            self.assertEqual(body["messages"][1]["role"], "assistant")
+            return httpx.Response(
+                200,
+                json={
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": [{"text": "Второй ответ"}],
+                        }
+                    ]
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.make_client(handler, temp_dir) as client:
+                first = client.step(
+                    "first-history",
+                    model="model",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [{"text": "Первый вопрос"}],
+                        }
+                    ],
+                )
+                second = client.step(
+                    "second-history",
+                    model="model",
+                    messages=first.history_messages
+                    + [
+                        {
+                            "role": "user",
+                            "content": [{"text": "Уточнение"}],
+                        }
+                    ],
+                )
+
+            self.assertEqual(first.request_texts_by_role["user"], "Первый вопрос")
+            self.assertEqual(first.response_texts_by_role["assistant"], "Первый ответ")
+            self.assertEqual(first.history_texts_by_role["user"], "Первый вопрос")
+            self.assertEqual(first.history_texts_by_role["assistant"], "Первый ответ")
+            self.assertEqual(
+                [message["role"] for message in first.history_messages],
+                ["user", "assistant"],
+            )
+            self.assertTrue((first.run_dir / "response_messages.json").exists())
+            self.assertTrue((first.run_dir / "history_messages.json").exists())
+            self.assertEqual(second.text, "Второй ответ")
+
     def test_http_error_is_saved_and_exposes_run_dir(self):
         def handler(request):
             return httpx.Response(422, json={"detail": "bad request"})

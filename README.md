@@ -59,6 +59,18 @@ print(result.run_dir)
 `result.function_calls` и `result.function_call_text`. Все собранные роли
 доступны в `result.texts_by_role`, включая `function_call`.
 
+Для сборки истории есть отдельные свойства:
+
+```python
+result.request_messages        # сообщения, которые ушли в запросе
+result.response_messages       # сообщения, которые вернула модель
+result.history_messages        # request_messages + response_messages
+
+result.request_texts_by_role
+result.response_texts_by_role
+result.history_texts_by_role
+```
+
 Поля `model`, `messages`, `model_options`, `tools` и любые будущие параметры
 передаются в `step()` или `chat()` как есть.
 
@@ -138,6 +150,45 @@ print(result.function_call_text)
 Для совместимого формата он извлекается из `choices[].message.function_call`.
 На диск дополнительно пишутся `function_calls.json` и `function_call.txt`.
 
+## История сообщений
+
+После любого шага можно взять готовую историю и передать ее в следующий вызов:
+
+```python
+first = client.step(
+    "first",
+    model="GigaChat-2-Max",
+    messages=[
+        {
+            "role": "user",
+            "content": [{"text": "Сформулируй короткую гипотезу"}],
+        }
+    ],
+)
+
+second = client.step(
+    "second",
+    model="GigaChat-2-Max",
+    messages=first.history_messages
+    + [
+        {
+            "role": "user",
+            "content": [{"text": "Теперь проверь ее на слабые места"}],
+        }
+    ],
+)
+```
+
+Тексты по ролям можно использовать для условий и переменных:
+
+```python
+user_text = first.history_texts_by_role["user"]
+assistant_text = first.history_texts_by_role["assistant"]
+function_call = first.history_texts_by_role.get("function_call", "")
+```
+
+История дополнительно сохраняется в `history_messages.json`.
+
 ## Предсохраненные шаги
 
 Можно заранее собрать набор шагов, сохранить их в JSON, а потом запускать в
@@ -210,6 +261,8 @@ custom = client.request(
 - `request.json`;
 - `response.json`;
 - `metadata.json`;
+- `response_messages.json`;
+- `history_messages.json`;
 - `text.txt`;
 - `assistant.txt`;
 - `reasoning.txt`, если модель вернула reasoning;
