@@ -56,20 +56,19 @@ print(result.run_dir)
 `result.text` является коротким алиасом для `result.assistant_text`. Сообщения
 с ролью `reasoning` не смешиваются с финальным ответом и доступны через
 `result.reasoning_text`. Вызовы функций доступны через
-`result.function_calls` и `result.function_call_text`. Все собранные роли
-доступны в `result.texts_by_role`, включая `function_call`.
+`result.function_calls` и `result.function_call_text`.
 
-Для сборки истории есть отдельные свойства:
+Для сообщений есть единый метод:
 
 ```python
-result.request_messages        # сообщения, которые ушли в запросе
-result.response_messages       # сообщения, которые вернула модель
-result.history_messages        # request_messages + response_messages без reasoning
-result.full_history_messages   # request_messages + response_messages полностью
+result.messages()              # conversation: история без system и reasoning
+result.messages("request")     # сообщения, которые ушли в запрос
+result.messages("response")    # сообщения, которые вернула модель
+result.messages("history")     # request + response без reasoning
+result.messages("full_history")# request + response полностью
 
-result.request_texts_by_role
-result.response_texts_by_role
-result.history_texts_by_role
+result.role_texts()            # тексты по ролям для conversation
+result.role_texts("response")  # тексты по ролям для ответа модели
 ```
 
 Поля `model`, `messages`, `model_options`, `tools` и любые будущие параметры
@@ -153,7 +152,9 @@ print(result.function_call_text)
 
 ## История сообщений
 
-После любого шага можно взять готовую историю и передать ее в следующий вызов:
+После любого шага можно взять готовую историю и передать ее в следующий вызов.
+По умолчанию `messages()` возвращает conversation-историю: там уже нет
+`reasoning` и `system`.
 
 ```python
 first = client.step(
@@ -170,7 +171,7 @@ first = client.step(
 second = client.step(
     "second",
     model="GigaChat-2-Max",
-    messages=first.history_messages
+    messages=first.messages()
     + [
         {
             "role": "user",
@@ -180,19 +181,31 @@ second = client.step(
 )
 ```
 
-`history_messages` не включает сообщения с ролью `reasoning`, чтобы не
-прокидывать внутренние рассуждения модели в следующий запрос. Если нужен полный
-след для анализа, используйте `full_history_messages` или `response_messages`.
+`messages("history")` не включает сообщения с ролью `reasoning`, чтобы не
+прокидывать внутренние рассуждения модели в следующий запрос. `messages()` или
+`messages("conversation")` дополнительно исключает `system`, чтобы системный
+промпт не дублировался при следующем вызове.
+
+Если нужен явный контроль ролей:
+
+```python
+messages = first.messages("full_history", exclude_roles={"system", "reasoning"})
+texts = first.role_texts("full_history", exclude_roles={"system"})
+```
+
+Если нужен полный след для анализа, используйте `messages("full_history")` или
+`messages("response")`.
 
 Тексты по ролям можно использовать для условий и переменных:
 
 ```python
-user_text = first.history_texts_by_role["user"]
-assistant_text = first.history_texts_by_role["assistant"]
-function_call = first.history_texts_by_role.get("function_call", "")
+user_text = first.role_texts()["user"]
+assistant_text = first.role_texts()["assistant"]
+function_call = first.role_texts().get("function_call", "")
 ```
 
-История дополнительно сохраняется в `history_messages.json`.
+История дополнительно сохраняется в `history_messages.json` и
+`conversation_messages.json`.
 
 ## Предсохраненные шаги
 
@@ -268,6 +281,7 @@ custom = client.request(
 - `metadata.json`;
 - `response_messages.json`;
 - `history_messages.json`;
+- `conversation_messages.json`;
 - `text.txt`;
 - `assistant.txt`;
 - `reasoning.txt`, если модель вернула reasoning;

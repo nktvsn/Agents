@@ -96,6 +96,14 @@ def _extract_role_chunks(
     return chunks
 
 
+def _normalize_function_call_for_message(function_call: Mapping[str, Any]) -> JsonDict:
+    normalized = dict(function_call)
+    arguments = normalized.get("arguments")
+    if arguments is not None and not isinstance(arguments, str):
+        normalized["arguments"] = _json_text(arguments)
+    return normalized
+
+
 def _copy_message(message: Mapping[str, Any]) -> JsonDict:
     copied: JsonDict = {}
     for key in (
@@ -104,10 +112,40 @@ def _copy_message(message: Mapping[str, Any]) -> JsonDict:
         "message_id",
         "tools_state_id",
         "functions_state_id",
-        "function_call",
     ):
         if key in message:
             copied[key] = message[key]
+    content = copied.get("content")
+    if isinstance(content, list):
+        normalized_content = []
+        for item in content:
+            if (
+                isinstance(item, dict)
+                and isinstance(item.get("function_call"), dict)
+            ):
+                updated = dict(item)
+                updated["function_call"] = _normalize_function_call_for_message(
+                    item["function_call"]
+                )
+                normalized_content.append(updated)
+            else:
+                normalized_content.append(item)
+        copied["content"] = normalized_content
+    function_call = message.get("function_call")
+    if isinstance(function_call, dict):
+        normalized_call = _normalize_function_call_for_message(function_call)
+        content = copied.get("content")
+        if isinstance(content, list):
+            has_call = any(
+                isinstance(item, dict) and isinstance(item.get("function_call"), dict)
+                for item in content
+            )
+            if not has_call:
+                copied["content"] = list(content) + [{"function_call": normalized_call}]
+        elif isinstance(content, str) and content:
+            copied["content"] = [{"text": content}, {"function_call": normalized_call}]
+        else:
+            copied["content"] = [{"function_call": normalized_call}]
     return copied
 
 
@@ -169,6 +207,25 @@ def message_texts_by_role(messages: Iterable[Mapping[str, Any]]) -> JsonDict:
         resolved_role = role or "assistant"
         result[resolved_role] = result.get(resolved_role, "") + text
     return result
+
+
+def _filter_messages(
+    messages: Iterable[Mapping[str, Any]],
+    *,
+    include_roles: Optional[Iterable[str]] = None,
+    exclude_roles: Optional[Iterable[str]] = None,
+) -> List[JsonDict]:
+    includes = set(include_roles) if include_roles is not None else None
+    excludes = set(exclude_roles or [])
+    filtered: List[JsonDict] = []
+    for message in messages:
+        role = message.get("role")
+        if includes is not None and role not in includes:
+            continue
+        if role in excludes:
+            continue
+        filtered.append(dict(message))
+    return filtered
 
 
 def _function_call_record(
@@ -385,68 +442,84 @@ class RunResult:
         """Final assistant text. Kept as the main notebook convenience property."""
         return self.assistant_text
 
-    @property
-    def texts_by_role(self) -> JsonDict:
-        if self.events:
-            streamed = _stream_texts_by_role(self.events)
-            if streamed:
-                return streamed
-        result: JsonDict = {}
-        for role, text in _extract_role_chunks(self.response):
-            resolved_role = role or "assistant"
-            result[resolved_role] = result.get(resolved_role, "") + text
-        calls = self.function_calls
-        if calls:
-            result["function_call"] = _function_call_text(calls)
-        return result
-
-    @property
-    def request_messages(self) -> List[JsonDict]:
+    def _request_messages(self) -> List[JsonDict]:
         payload = self.request.get("json")
         if not isinstance(payload, dict):
             return []
         messages = payload.get("messages")
         return [dict(message) for message in messages if isinstance(message, dict)] if isinstance(messages, list) else []
 
-    @property
-    def response_messages(self) -> List[JsonDict]:
+    def _response_messages(self) -> List[JsonDict]:
         if self.events:
             streamed = _stream_messages(self.events)
             if streamed:
                 return streamed
         return _extract_messages(self.response)
 
-    @property
-    def history_messages(self) -> List[JsonDict]:
-        return self.request_messages + [
+    def _history_messages(self) -> List[JsonDict]:
+        return self._request_messages() + [
             message
-            for message in self.response_messages
+            for message in self._response_messages()
             if message.get("role") != "reasoning"
         ]
 
-    @property
-    def full_history_messages(self) -> List[JsonDict]:
-        return self.request_messages + self.response_messages
+    def _full_history_messages(self) -> List[JsonDict]:
+        return self._request_messages() + self._response_messages()
 
     @property
-    def request_texts_by_role(self) -> JsonDict:
-        return message_texts_by_role(self.request_messages)
+    def conversation_messages(self) -> List[JsonDict]:
+        return self.messages("conversation")
 
-    @property
-    def response_texts_by_role(self) -> JsonDict:
-        return self.texts_by_role
+    def messages(
+        self,
+        source: str = "conversation",
+        *,
+        include_roles: Optional[Iterable[str]] = None,
+        exclude_roles: Optional[Iterable[str]] = None,
+    ) -> List[JsonDict]:
+        if source == "request":
+            messages = self._request_messages()
+        elif source == "response":
+            messages = self._response_messages()
+        elif source == "history":
+            messages = self._history_messages()
+        elif source == "conversation":
+            messages = self._history_messages()
+            exclude_roles = set(exclude_roles or []) | {"system", "reasoning"}
+        elif source == "full_history":
+            messages = self._full_history_messages()
+        else:
+            raise ValueError(
+                "source must be one of: request, response, history, conversation, full_history"
+            )
+        return _filter_messages(
+            messages,
+            include_roles=include_roles,
+            exclude_roles=exclude_roles,
+        )
 
-    @property
-    def history_texts_by_role(self) -> JsonDict:
-        return message_texts_by_role(self.history_messages)
+    def role_texts(
+        self,
+        source: str = "conversation",
+        *,
+        include_roles: Optional[Iterable[str]] = None,
+        exclude_roles: Optional[Iterable[str]] = None,
+    ) -> JsonDict:
+        return message_texts_by_role(
+            self.messages(
+                source,
+                include_roles=include_roles,
+                exclude_roles=exclude_roles,
+            )
+        )
 
     @property
     def assistant_text(self) -> str:
-        return self.texts_by_role.get("assistant", "")
+        return self.role_texts("response").get("assistant", "")
 
     @property
     def reasoning_text(self) -> str:
-        return self.texts_by_role.get("reasoning", "")
+        return self.role_texts("response").get("reasoning", "")
 
     @property
     def function_calls(self) -> List[JsonDict]:
@@ -458,7 +531,7 @@ class RunResult:
 
     @property
     def function_call_text(self) -> str:
-        return self.texts_by_role.get("function_call", "")
+        return self.role_texts("response").get("function_call", "")
 
     @property
     def usage(self) -> JsonDict:
@@ -960,10 +1033,18 @@ class LLMClient:
                 "saved_at": datetime.now(timezone.utc),
             },
         )
-        if result.response_messages:
-            _write_json(result.run_dir / "response_messages.json", result.response_messages)
-        if result.history_messages:
-            _write_json(result.run_dir / "history_messages.json", result.history_messages)
+        response_messages = result.messages("response")
+        history_messages = result.messages("history")
+        conversation_messages = result.messages("conversation")
+        if response_messages:
+            _write_json(result.run_dir / "response_messages.json", response_messages)
+        if history_messages:
+            _write_json(result.run_dir / "history_messages.json", history_messages)
+        if conversation_messages:
+            _write_json(
+                result.run_dir / "conversation_messages.json",
+                conversation_messages,
+            )
         (result.run_dir / "text.txt").write_text(result.text, encoding="utf-8")
         (result.run_dir / "assistant.txt").write_text(
             result.assistant_text,

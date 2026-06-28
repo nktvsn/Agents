@@ -55,7 +55,7 @@ class LLMClientTests(unittest.TestCase):
             self.assertEqual(result.assistant_text, "Готово")
             self.assertEqual(result.reasoning_text, "Сначала проверю.")
             self.assertEqual(
-                result.texts_by_role,
+                result.role_texts("response"),
                 {
                     "reasoning": "Сначала проверю.",
                     "assistant": "Готово",
@@ -203,8 +203,14 @@ class LLMClientTests(unittest.TestCase):
             )
             self.assertIn("weather_forecast", result.function_call_text)
             self.assertEqual(
-                result.texts_by_role["function_call"],
+                result.role_texts("response")["function_call"],
                 result.function_call_text,
+            )
+            self.assertEqual(
+                result.messages("conversation")[0]["content"][0]["function_call"][
+                    "name"
+                ],
+                "weather_forecast",
             )
             self.assertTrue((result.run_dir / "function_calls.json").exists())
             self.assertTrue((result.run_dir / "function_call.txt").exists())
@@ -245,6 +251,21 @@ class LLMClientTests(unittest.TestCase):
                 10,
             )
             self.assertEqual(result.function_calls[0]["functions_state_id"], "state-2")
+            history_message = result.messages()[0]
+            self.assertEqual(history_message["role"], "assistant")
+            self.assertNotIn("function_call", history_message)
+            self.assertEqual(
+                history_message["content"][0]["function_call"]["name"],
+                "weather_forecast",
+            )
+            self.assertIsInstance(
+                history_message["content"][0]["function_call"]["arguments"],
+                str,
+            )
+            self.assertIn(
+                '"num_days": 10',
+                history_message["content"][0]["function_call"]["arguments"],
+            )
 
     def test_history_messages_include_user_and_model_response(self):
         def handler(request):
@@ -290,7 +311,7 @@ class LLMClientTests(unittest.TestCase):
                 second = client.step(
                     "second-history",
                     model="model",
-                    messages=first.history_messages
+                    messages=first.messages("history")
                     + [
                         {
                             "role": "user",
@@ -299,16 +320,17 @@ class LLMClientTests(unittest.TestCase):
                     ],
                 )
 
-            self.assertEqual(first.request_texts_by_role["user"], "Первый вопрос")
-            self.assertEqual(first.response_texts_by_role["assistant"], "Первый ответ")
-            self.assertEqual(first.history_texts_by_role["user"], "Первый вопрос")
-            self.assertEqual(first.history_texts_by_role["assistant"], "Первый ответ")
+            self.assertEqual(first.role_texts("request")["user"], "Первый вопрос")
+            self.assertEqual(first.role_texts("response")["assistant"], "Первый ответ")
+            self.assertEqual(first.role_texts("history")["user"], "Первый вопрос")
+            self.assertEqual(first.role_texts("history")["assistant"], "Первый ответ")
             self.assertEqual(
-                [message["role"] for message in first.history_messages],
+                [message["role"] for message in first.messages("history")],
                 ["user", "assistant"],
             )
             self.assertTrue((first.run_dir / "response_messages.json").exists())
             self.assertTrue((first.run_dir / "history_messages.json").exists())
+            self.assertTrue((first.run_dir / "conversation_messages.json").exists())
             self.assertEqual(second.text, "Второй ответ")
 
     def test_history_messages_exclude_reasoning_by_default(self):
@@ -343,19 +365,71 @@ class LLMClientTests(unittest.TestCase):
                 )
 
             self.assertEqual(
-                [message["role"] for message in result.response_messages],
+                [message["role"] for message in result.messages("response")],
                 ["reasoning", "assistant"],
             )
             self.assertEqual(
-                [message["role"] for message in result.history_messages],
+                [message["role"] for message in result.messages("history")],
                 ["user", "assistant"],
             )
             self.assertEqual(
-                [message["role"] for message in result.full_history_messages],
+                [message["role"] for message in result.messages("full_history")],
                 ["user", "reasoning", "assistant"],
             )
-            self.assertNotIn("reasoning", result.history_texts_by_role)
+            self.assertNotIn("reasoning", result.role_texts("history"))
             self.assertEqual(result.reasoning_text, "Скрытое рассуждение")
+
+    def test_messages_can_filter_system_role_for_conversation_history(self):
+        def handler(request):
+            return httpx.Response(
+                200,
+                json={
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": [{"text": "Ответ"}],
+                        }
+                    ]
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.make_client(handler, temp_dir) as client:
+                result = client.step(
+                    "system-history",
+                    model="model",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": [{"text": "Правила"}],
+                        },
+                        {
+                            "role": "user",
+                            "content": [{"text": "Вопрос"}],
+                        },
+                    ],
+            )
+
+            self.assertEqual(
+                [message["role"] for message in result.messages("history")],
+                ["system", "user", "assistant"],
+            )
+            self.assertEqual(
+                [message["role"] for message in result.messages(exclude_roles={"system"})],
+                ["user", "assistant"],
+            )
+            self.assertEqual(
+                [message["role"] for message in result.conversation_messages],
+                ["user", "assistant"],
+            )
+            self.assertEqual(
+                [message["role"] for message in result.messages()],
+                ["user", "assistant"],
+            )
+            self.assertEqual(
+                result.role_texts(exclude_roles={"system"}),
+                {"user": "Вопрос", "assistant": "Ответ"},
+            )
 
     def test_http_error_is_saved_and_exposes_run_dir(self):
         def handler(request):
